@@ -5,10 +5,7 @@ import requests
 from datetime import datetime
 import PyPDF2
 import tempfile
-from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
-import pinecone
-from pinecone import Pinecone, ServerlessSpec
 import json
 from bs4 import BeautifulSoup
 import logging
@@ -20,105 +17,68 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # Load environment variables from .env file
 load_dotenv()
 
-# Initialize Pinecone
-pc = Pinecone(api_key=os.environ.get("PINECONE_API_KEY"))
-
-# Check if the index exists
-if 'crawl4ai' not in pc.list_indexes().names():
-    # Create the index if it doesn't exist
-    logging.info("Creating new Pinecone index 'crawl4ai'")
-    pc.create_index(
-        name='crawl4ai',
-        dimension=384,
-        metric='cosine',
-        spec=ServerlessSpec(
-            cloud='aws',
-            region='us-east-1'
-        )
-    )
-    logging.info("Pinecone index 'crawl4ai' created successfully")
-
 class AcademicWebCrawler:
-    def __init__(self, clear_db=True):
-        self.init_pinecone()
-        self.model = SentenceTransformer('all-MiniLM-L6-v2')
-        self.pdf_dir = '/Users/masondumas/Desktop/Projects/Data_Extraction/crawl4ai/crawl4ai/paper_pdfs'
+    def __init__(self):
+        self.pdf_dir = '/Users/masondumas/Desktop/Projects/Data_Extraction/ai_news_scraper/crawl4ai/paper_pdfs'
         os.makedirs(self.pdf_dir, exist_ok=True)
         logging.info(f"PDF directory set to: {self.pdf_dir}")
-        self.init_database(clear=clear_db)
+        self.db_path = '/Users/masondumas/Desktop/Projects/Data_Extraction/ai_news_scraper/crawl4ai/paper_pdfs/arxiv_papers.db'
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        self.conn = sqlite3.connect(self.db_path)
+        self.cursor = self.conn.cursor()
+        self.init_database()
         logging.info("AcademicWebCrawler initialized")
 
-    def init_pinecone(self):
-        self.pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
-        index_name = os.getenv("PINECONE_INDEX_NAME")
-        
-        if index_name not in self.pc.list_indexes().names():
-            logging.info(f"Index '{index_name}' not found. Creating new index...")
-            self.pc.create_index(
-                name=index_name,
-                dimension=384,
-                metric='cosine',
-                spec=ServerlessSpec(
-                    cloud='aws',
-                    region='us-east-1'
-                )
+    def init_database(self):
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS papers (
+                id TEXT PRIMARY KEY,
+                title TEXT,
+                authors TEXT,
+                abstract TEXT,
+                date_saved DATE,
+                pdf_path TEXT,
+                pdf_url TEXT
             )
-            logging.info(f"Index '{index_name}' created successfully.")
-        
-        self.index = self.pc.Index(index_name)
-        logging.info(f"Pinecone index '{index_name}' initialized")
-
-    def init_database(self, clear=False):
-        self.conn = sqlite3.connect('arxiv_papers.db')
-        self.cursor = self.conn.cursor()
-        
-        if clear:
-            self.clear_database()
-        else:
-            self.cursor.execute('''
-                CREATE TABLE IF NOT EXISTS papers (
-                    id TEXT PRIMARY KEY,
-                    title TEXT,
-                    authors TEXT,
-                    abstract TEXT,
-                    date_saved DATE
-                )
-            ''')
-            self.conn.commit()
+        ''')
+        self.conn.commit()
+        logging.info("Database initialized or existing table confirmed")
 
     def save_to_database(self, paper):
         self.cursor.execute('''
-            INSERT OR REPLACE INTO papers (id, title, authors, abstract, date_saved)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (paper['id'], paper['title'], paper['authors'], paper['abstract'], paper['date_saved']))
+            INSERT OR REPLACE INTO papers (id, title, authors, abstract, date_saved, pdf_path, pdf_url)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            paper['id'],
+            paper['title'],
+            paper['authors'],
+            paper['abstract'],
+            paper['date_saved'],
+            paper.get('pdf_path'),
+            paper.get('pdf_url')  # Make sure this is included
+        ))
         self.conn.commit()
+        logging.info(f"Saved paper to database: {paper['title']} with PDF URL: {paper.get('pdf_url')}")
 
     def save_paper(self, paper, pdf_content):
         paper_id = paper['id']
+        today_date = datetime.now().strftime('%Y-%m-%d')
+        date_folder = os.path.join(self.pdf_dir, today_date)
+        os.makedirs(date_folder, exist_ok=True)
+        
         pdf_filename = f"{paper_id}.pdf"
-        pdf_dir = '/Users/masondumas/Desktop/Projects/Data_Extraction/crawl4ai/crawl4ai/paper_pdfs'
-        pdf_path = os.path.join(pdf_dir, pdf_filename)
+        pdf_path = os.path.join(date_folder, pdf_filename)
 
         try:
-            os.makedirs(pdf_dir, exist_ok=True)
             with open(pdf_path, 'wb') as f:
                 f.write(pdf_content)
             logging.info(f"PDF saved: {pdf_path}")
 
-            text_to_embed = f"{paper['title']} {paper['authors']} {paper['abstract']}"
-            embedding = self.model.encode(text_to_embed).tolist()
-
-            metadata = {
-                'title': paper['title'],
-                'authors': paper['authors'],
-                'abstract': paper['abstract'],
-                'date': paper['date_saved'],
-                'pdf_path': pdf_path
-            }
-            self.index.upsert([(paper_id, embedding, metadata)])
-            logging.info(f"Paper metadata saved to Pinecone: {paper['title']}")
+            paper['pdf_path'] = pdf_path
+            self.save_to_database(paper)
+            logging.info(f"Paper metadata saved to database: {paper['title']}")
         except Exception as e:
-            logging.error(f"Error saving paper {paper_id}: {e}")
+            logging.error(f"Error saving paper {paper_id}: {e}", exc_info=True)
 
     def parse_academic_page(self, url):
         logging.info(f"Parsing academic page: {url}")
@@ -185,9 +145,16 @@ class AcademicWebCrawler:
 
                     # Check if paper already exists in database
                     self.cursor.execute("SELECT id FROM papers WHERE id = ?", (paper_id,))
-                    if self.cursor.fetchone():
+                    result = self.cursor.fetchone()
+                    logging.debug(f"Checking for paper ID {paper_id} in database")
+                    logging.debug(f"Database query result: {result}")
+                    logging.debug(f"Current database path: {os.path.abspath(self.db_path)}")
+
+                    if result:
                         logging.info(f"Paper {paper_id} already exists in database. Skipping.")
                         continue
+
+                    logging.info(f"Processing new paper with ID: {paper_id}")
 
                     title_element = dd.find('div', class_='list-title')
                     if not title_element:
@@ -206,19 +173,29 @@ class AcademicWebCrawler:
                         'authors': authors,
                         'abstract': abstract,
                         'date_saved': today_date,
+                        'pdf_path': None,
+                        'pdf_url': None
                     }
                     
-                    pdf_link = dd.find('a', {'title': 'Download PDF'})
+                    logging.debug(f"Paper data before PDF download: {paper_data}")
+                    
+                    # Update this part to more reliably find the PDF URL
+                    pdf_link = dt.find('a', {'title': 'Download PDF'})
                     if pdf_link and 'href' in pdf_link.attrs:
                         pdf_url = f"https://arxiv.org{pdf_link['href']}"
-                        pdf_content = self.download_pdf(pdf_url)
+                        paper_data['pdf_url'] = pdf_url.replace('abs', 'pdf')  # Ensure we get the direct PDF link
+                        logging.info(f"Found PDF URL: {paper_data['pdf_url']}")
+                        pdf_content = self.download_pdf(paper_data['pdf_url'])
                         if pdf_content:
                             extracted_abstract = self.extract_abstract_from_pdf(pdf_content)
                             if extracted_abstract:
                                 paper_data['abstract'] = extracted_abstract
                             self.save_paper(paper_data, pdf_content)
+                            logging.debug(f"Paper data after save_paper: {paper_data}")
                         else:
                             logging.warning(f"Failed to download PDF for paper: {paper_data['title']}")
+                    else:
+                        logging.warning(f"Could not find PDF link for paper: {paper_data['title']}")
                     
                     # If we couldn't get the abstract from the PDF, try to get it from the abstract page
                     if not paper_data['abstract']:
@@ -230,15 +207,14 @@ class AcademicWebCrawler:
                             if abstract_element:
                                 paper_data['abstract'] = abstract_element.text.strip()
                     
-                    # Save to database
+                    # Make sure to save to database even if PDF download fails
                     self.save_to_database(paper_data)
-                    
                     papers.append(paper_data)
                     logging.info(f"Processed and saved arXiv paper: {title}")
                 except AttributeError as e:
                     logging.error(f"Failed to parse paper: {e}")
                 except Exception as e:
-                    logging.error(f"Unexpected error parsing paper: {e}")
+                    logging.error(f"Unexpected error parsing paper: {e}", exc_info=True)
 
         logging.info(f"Found and processed {len(papers)} new papers on arXiv")
         return papers
@@ -346,7 +322,9 @@ class AcademicWebCrawler:
                     title TEXT,
                     authors TEXT,
                     abstract TEXT,
-                    date_saved DATE
+                    date_saved DATE,
+                    pdf_path TEXT,
+                    pdf_url TEXT
                 )
             ''')
             self.conn.commit()
@@ -398,9 +376,9 @@ class AcademicPaperFilter:
             logging.warning(f"Invalid date format for paper: {paper['title']}")
             return True
 
-def crawl_academic_websites(urls, clear_db=False):
+def crawl_academic_websites(urls):
     logging.info(f"Initializing the academic crawler for {len(urls)} URLs")
-    crawler = AcademicWebCrawler(clear_db=clear_db)
+    crawler = AcademicWebCrawler()
     
     all_papers = []
     for url in urls:
@@ -415,12 +393,7 @@ def crawl_academic_websites(urls, clear_db=False):
     return all_papers
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        logging.error("Usage: python crawl_service.py <url1> <url2> ...")
-        sys.exit(1)
-    
-    urls = sys.argv[1:]
-    
-    papers = crawl_academic_websites(urls, clear_db=True)
+    url = "https://arxiv.org/list/cs.AI/new"
+    papers = crawl_academic_websites([url])
     print(json.dumps(papers, indent=2))
     logging.info("Crawling process completed successfully")
